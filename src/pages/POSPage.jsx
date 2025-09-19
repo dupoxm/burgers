@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { useAppContext } from '@/contexts/AppContext';
 import { CATEGORIES } from '@/data';
 import { Button } from '@/components/ui/button';
@@ -14,9 +14,114 @@ import AddProductModal from '@/components/modals/AddProductModal';
 import EditProductModal from '@/components/modals/EditProductModal';
 import MobileOrderSummaryModal from '@/components/modals/MobileOrderSummaryModal';
 import DrinkSelectionModal from '@/components/modals/DrinkSelectionModal';
+import ReceiptPromptModal from '@/components/modals/ReceiptPromptModal';
 import { cn } from "@/lib/utils";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import { useToast } from '@/components/ui/use-toast';
+import { ToastAction } from '@/components/ui/toast';
+import { generateThermalReceiptPdf } from '@/lib/receiptGenerator';
+
+const STORE_INFO = {
+  name: 'Burgers&Dogs',
+  address: 'Av. Sabor 123, Ciudad Gourmet, MX',
+  phone: '55 1234 5678',
+  rfc: 'BDS920101AB1',
+};
+
+const PAYMENT_METHOD_LABELS = {
+  cash: 'EFECTIVO',
+  card: 'TARJETA',
+  transfer: 'TRANSFERENCIA',
+  mercadopago: 'MERCADO_PAGO',
+  dollars: 'DOLARES',
+};
+
+const normalizeNumber = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const createReceiptOrder = (orderItems, paymentDetails, orderResponse) => {
+  const currency = paymentDetails.method === 'dollars' ? 'USD' : 'MXN';
+
+  const items = orderItems.map(item => {
+    const extras = item.extras || [];
+    const extrasPerUnit = extras.reduce((sum, extra) => sum + normalizeNumber(extra.price) * (extra.quantity || 0), 0);
+    const baseUnitPrice = Math.max(normalizeNumber(item.price) - extrasPerUnit, 0);
+
+    const addons = [];
+    if (extras.length > 0) {
+      extras.forEach(extra => {
+        const extraQty = extra.quantity || 0;
+        if (extraQty > 0) {
+          addons.push({
+            name: `Extra: ${extra.name}${extraQty > 1 ? ` x${extraQty}` : ''}`,
+            price: normalizeNumber(extra.price) * extraQty * item.quantity,
+          });
+        }
+      });
+    }
+
+    if (item.complements && item.complements.length > 0) {
+      item.complements.forEach(complement => {
+        addons.push({
+          name: `Incluido: ${complement.name}`,
+          price: 0,
+        });
+      });
+    }
+
+    return {
+      id: item.isCombo ? item.comboId ?? item.id : item.id,
+      name: item.name,
+      qty: item.quantity,
+      unitPrice: Number(baseUnitPrice.toFixed(2)),
+      notes: item.notes,
+      addons,
+    };
+  });
+
+  const subtotal = items.reduce((sum, orderItem) => {
+    const addonsTotal = (orderItem.addons || []).reduce((addonSum, addon) => addonSum + normalizeNumber(addon.price), 0);
+    return sum + normalizeNumber(orderItem.unitPrice) * orderItem.qty + addonsTotal;
+  }, 0);
+
+  const responseTotal = orderResponse?.total_amount;
+  const total = responseTotal != null && !Number.isNaN(Number(responseTotal)) ? Number(responseTotal) : subtotal;
+
+  const paymentMethod = PAYMENT_METHOD_LABELS[paymentDetails.method] || 'EFECTIVO';
+  const shouldIncludeCash = paymentDetails.method === 'cash' || paymentDetails.method === 'dollars';
+  const cashGivenValue = shouldIncludeCash && paymentDetails.amountPaid != null ? normalizeNumber(paymentDetails.amountPaid) : undefined;
+  const changeValue = paymentDetails.change != null ? normalizeNumber(paymentDetails.change) : undefined;
+
+  const paymentInfo = {
+    method: paymentMethod,
+    currency,
+  };
+
+  if (shouldIncludeCash && paymentDetails.amountPaid != null) {
+    paymentInfo.cashGiven = cashGivenValue;
+  }
+
+  if (changeValue != null && !Number.isNaN(changeValue)) {
+    paymentInfo.change = changeValue;
+  }
+
+  const receiptOrder = {
+    id: orderResponse?.id ? orderResponse.id.toString() : `TMP-${Date.now()}`,
+    createdAt: orderResponse?.created_at || new Date().toISOString(),
+    items,
+    subtotal: Number(subtotal.toFixed(2)),
+    discount: 0,
+    taxes: 0,
+    total: Number(total.toFixed(2)),
+    payment: paymentInfo,
+    customerName: orderResponse?.customer_name || undefined,
+    store: STORE_INFO,
+  };
+
+  return receiptOrder;
+};
 const MobileOrderSummaryButton = ({
   orderTotal,
   orderItemCount,
@@ -64,11 +169,41 @@ const POSPage = ({
   const [isClearOrderConfirmOpen, setIsClearOrderConfirmOpen] = useState(false);
   const [isDrinkSelectionOpen, setIsDrinkSelectionOpen] = useState(false);
   const [productForCombo, setProductForCombo] = useState(null);
+  const [isReceiptPromptOpen, setIsReceiptPromptOpen] = useState(false);
+  const [isGeneratingReceipt, setIsGeneratingReceipt] = useState(false);
+  const [lastGeneratedReceiptUrl, setLastGeneratedReceiptUrl] = useState(null);
+  const [pendingReceiptOrder, setPendingReceiptOrder] = useState(null);
+  const [receiptPaperWidth, setReceiptPaperWidth] = useState(58);
   useEffect(() => {
     if (!isLoading && products.length === 0) {
       fetchProducts();
     }
   }, [isLoading, products, fetchProducts]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const storedWidth = window.localStorage.getItem('receiptPaperWidth');
+    if (storedWidth) {
+      const parsed = parseInt(storedWidth, 10);
+      if (parsed === 58 || parsed === 80) {
+        setReceiptPaperWidth(parsed);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('receiptPaperWidth', receiptPaperWidth.toString());
+    }
+  }, [receiptPaperWidth]);
+
+  useEffect(() => {
+    return () => {
+      if (lastGeneratedReceiptUrl) {
+        URL.revokeObjectURL(lastGeneratedReceiptUrl);
+      }
+    };
+  }, [lastGeneratedReceiptUrl]);
   const filteredProducts = useMemo(() => {
     if (isLoading) return [];
     const currentCatDbValue = CATEGORIES.find(cat => cat.id === selectedCategory)?.dbValue || selectedCategory;
@@ -115,10 +250,113 @@ const POSPage = ({
     setIsExtrasModalOpen(false);
     setSelectedItemForExtras(null);
   };
-  const handleConfirmPayment = paymentDetails => {
-    confirmOrder(paymentDetails);
-    setIsPaymentModalOpen(false);
-  };
+  const handleReceiptPromptCancel = useCallback(() => {
+    setIsReceiptPromptOpen(false);
+    setPendingReceiptOrder(null);
+  }, []);
+
+  const handleGenerateReceipt = useCallback(async () => {
+    if (!pendingReceiptOrder) {
+      return;
+    }
+
+    setIsGeneratingReceipt(true);
+    try {
+      const { url } = generateThermalReceiptPdf(pendingReceiptOrder, { paperWidthMM: receiptPaperWidth });
+      if (!url) {
+        throw new Error('No se pudo generar el archivo del recibo.');
+      }
+
+      if (lastGeneratedReceiptUrl) {
+        URL.revokeObjectURL(lastGeneratedReceiptUrl);
+      }
+
+      setLastGeneratedReceiptUrl(url);
+
+      let openedWindow;
+      if (typeof window !== 'undefined') {
+        openedWindow = window.open(url, '_blank');
+      }
+
+      const action = <ToastAction altText="Abrir recibo" onClick={() => {
+        if (typeof window !== 'undefined') {
+          window.open(url, '_blank');
+        }
+      }}>Abrir</ToastAction>;
+
+      if (openedWindow) {
+        openedWindow.focus?.();
+        toast({
+          title: 'Recibo listo para imprimir',
+          description: `Formato ${receiptPaperWidth} mm generado correctamente.`,
+          action,
+        });
+      } else {
+        toast({
+          title: 'Recibo generado',
+          description: 'Permite las ventanas emergentes para visualizarlo.',
+          action,
+        });
+      }
+
+      setIsReceiptPromptOpen(false);
+      setPendingReceiptOrder(null);
+    } catch (error) {
+      console.error('Error generando el recibo:', error);
+      toast({
+        title: 'Error al generar recibo',
+        description: error.message || 'Intenta nuevamente.',
+        variant: 'destructive',
+      });
+    } finally {
+      setIsGeneratingReceipt(false);
+    }
+  }, [pendingReceiptOrder, receiptPaperWidth, lastGeneratedReceiptUrl, toast]);
+
+  const handleOpenLastReceipt = useCallback(() => {
+    if (!lastGeneratedReceiptUrl) {
+      return;
+    }
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const popup = window.open(lastGeneratedReceiptUrl, '_blank');
+    if (!popup) {
+      toast({
+        title: 'No se pudo abrir el recibo',
+        description: 'Permite las ventanas emergentes para continuar.',
+        variant: 'destructive',
+      });
+    } else {
+      popup.focus?.();
+    }
+  }, [lastGeneratedReceiptUrl, toast]);
+  const handleConfirmPayment = useCallback(async paymentDetails => {
+    if (currentOrder.length === 0) {
+      return false;
+    }
+
+    const orderSnapshot = currentOrder.map(item => ({
+      ...item,
+      extras: item.extras ? item.extras.map(extra => ({ ...extra })) : [],
+      complements: item.complements ? item.complements.map(complement => ({ ...complement })) : [],
+    }));
+
+    try {
+      const orderData = await confirmOrder(paymentDetails);
+      if (orderData) {
+        const receiptOrder = createReceiptOrder(orderSnapshot, paymentDetails, orderData);
+        setPendingReceiptOrder(receiptOrder);
+        setIsReceiptPromptOpen(true);
+        return true;
+      }
+      return false;
+    } catch (error) {
+      console.error('Error al confirmar el pago:', error);
+      return false;
+    }
+  }, [confirmOrder, currentOrder]);
   const handleOpenAddProductModal = () => {
     setIsAddProductModalOpen(true);
   };
@@ -194,6 +432,17 @@ const POSPage = ({
       {selectedItemForExtras && <ExtrasModal item={selectedItemForExtras} isOpen={isExtrasModalOpen} onClose={handleCloseExtrasModal} onAddExtra={addExtraToItem} onUpdateExtraQuantity={updateExtraQuantity} />}
 
       {isPaymentModalOpen && <PaymentModal orderTotal={orderTotal} isOpen={isPaymentModalOpen} onClose={() => setIsPaymentModalOpen(false)} onConfirmPayment={handleConfirmPayment} />}
+
+      <ReceiptPromptModal
+        isOpen={isReceiptPromptOpen}
+        isGenerating={isGeneratingReceipt}
+        paperWidth={receiptPaperWidth}
+        onPaperWidthChange={setReceiptPaperWidth}
+        onConfirm={handleGenerateReceipt}
+        onCancel={handleReceiptPromptCancel}
+        hasPreviousReceipt={Boolean(lastGeneratedReceiptUrl)}
+        onOpenPreviousReceipt={handleOpenLastReceipt}
+      />
       
       <AddProductModal isOpen={isAddProductModalOpen} onClose={handleCloseAddProductModal} />
       

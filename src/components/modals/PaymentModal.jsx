@@ -5,7 +5,7 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
     import { Input } from '@/components/ui/input';
     import { Label } from '@/components/ui/label';
     import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-    import { CheckCircle, CreditCard, DollarSign, Landmark, Smartphone, ArrowLeft, X, Globe } from 'lucide-react';
+    import { CheckCircle, CreditCard, DollarSign, Landmark, Smartphone, ArrowLeft, X, Globe, Loader2 } from 'lucide-react';
     import { PAYMENT_METHODS } from '@/data';
     import { cn } from "@/lib/utils";
     import { ScrollArea } from '@/components/ui/scroll-area';
@@ -30,6 +30,7 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
       const [amountPaid, setAmountPaid] = useState('');
       const [change, setChange] = useState(0);
       const [exchangeRate, setExchangeRate] = useState('');
+      const [isSubmitting, setIsSubmitting] = useState(false);
       const amountInputRef = useRef(null);
       const exchangeRateInputRef = useRef(null);
 
@@ -76,12 +77,12 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
         setExchangeRate(e.target.value);
       };
 
-      const handleConfirm = () => {
+      const handleConfirm = async () => {
         if (!paymentMethod) {
           alert("Por favor, selecciona un método de pago.");
           return;
         }
-        
+
         let paymentDetails = {
           method: paymentMethod,
           total: orderTotal
@@ -110,8 +111,17 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
           paymentDetails.change = 0;
         }
 
-        onConfirmPayment(paymentDetails);
-        onClose(); 
+        setIsSubmitting(true);
+        try {
+          const confirmed = await onConfirmPayment(paymentDetails);
+          if (confirmed) {
+            onClose();
+          }
+        } catch (error) {
+          console.error('Error confirming payment:', error);
+        } finally {
+          setIsSubmitting(false);
+        }
       };
 
       const handlePaymentMethodSelect = (selectedMethodId) => {
@@ -161,7 +171,12 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
           className="flex flex-col items-center justify-center p-4 sm:p-6 space-y-4 sm:space-y-6 w-full"
         >
           <Label className="text-md sm:text-lg font-semibold text-gray-700 mb-1 sm:mb-2 block self-start">Método de Pago</Label>
-          <RadioGroup value={paymentMethod || ""} onValueChange={handlePaymentMethodSelect} className="grid grid-cols-2 gap-2.5 sm:gap-3 w-full">
+            <RadioGroup
+              value={paymentMethod || ""}
+              onValueChange={handlePaymentMethodSelect}
+              className="grid grid-cols-2 gap-2.5 sm:gap-3 w-full"
+              disabled={isSubmitting}
+            >
             {PAYMENT_METHODS.map((method) => (
               <Label 
                 key={method.id}
@@ -294,13 +309,21 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
               >
                 {currentView !== 'selectMethod' ? 'Cambiar Método' : 'Cancelar'}
               </Button>
-              <Button 
-                className="bg-brand-green hover:bg-brand-green/90 text-white h-11 sm:h-12 text-sm sm:text-base px-4 sm:px-6 font-semibold rounded-lg w-full sm:w-auto" 
-                onClick={handleConfirm}
-                disabled={isConfirmDisabled()}
-              >
-                <CheckCircle size={20} className="mr-1.5 sm:mr-2"/> Confirmar y Pagar
-              </Button>
+                <Button
+                  className="bg-brand-green hover:bg-brand-green/90 text-white h-11 sm:h-12 text-sm sm:text-base px-4 sm:px-6 font-semibold rounded-lg w-full sm:w-auto"
+                  onClick={handleConfirm}
+                  disabled={isConfirmDisabled() || isSubmitting}
+                >
+                  {isSubmitting ? (
+                    <>
+                      <Loader2 className="mr-1.5 sm:mr-2 h-4 w-4 animate-spin" /> Procesando...
+                    </>
+                  ) : (
+                    <>
+                      <CheckCircle size={20} className="mr-1.5 sm:mr-2"/> Confirmar y Pagar
+                    </>
+                  )}
+                </Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>
